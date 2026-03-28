@@ -20,6 +20,11 @@ NEO4J_PASSWORD = "bloodhoundcommunityedition"  # change if you set a custom pass
 # Decrease for faster runs on small datasets.
 MAX_PATHS = 500
 
+# Maximum hops for shortestPath queries.
+# Paths longer than this are usually the same root cause repeated
+# across many users. Increase if you suspect findings are being missed.
+MAX_HOPS = 6
+
 # ── Edge Narratives ───────────────────────────────────────────────────────────
 EDGE_NARRATIVES = {
     "GenericAll":            "has full control over",
@@ -131,10 +136,13 @@ QUERIES = [
         "DA Paths — Privilege Abuse Only",
         """
         MATCH p=shortestPath(
-            (u:User {enabled:true})-[*1..10]->(g:Group)
+            (u:User {enabled:true})-[*1..$max_hops]->(g:Group)
         )
         WHERE g.name =~ '(?i)domain admins@.*'
-          AND NOT (u)-[:MemberOf*1..]->(g)
+          AND NOT EXISTS {
+            MATCH (u)-[:MemberOf*1..]->(dg:Group)
+            WHERE dg.name =~ '(?i)domain admins@.*'
+          }
         RETURN p
         LIMIT $max_paths
         """,
@@ -143,7 +151,7 @@ QUERIES = [
         "Kerberoastable to DA",
         """
         MATCH p=shortestPath(
-            (u:User {hasspn:true, enabled:true})-[*1..10]->(g:Group)
+            (u:User {hasspn:true, enabled:true})-[*1..$max_hops]->(g:Group)
         )
         WHERE g.name =~ '(?i)domain admins@.*'
           AND NOT (u)-[:MemberOf*1..]->(g)
@@ -175,7 +183,13 @@ QUERIES = [
         "Unconstrained Delegation Computers (Non-DC)",
         """
         MATCH (c:Computer {unconstraineddelegation:true})
-        WHERE (c.isdc = false OR c.isdc IS NULL)
+        WHERE c.isdc <> true
+          AND NOT c.name =~ '(?i)^dc[0-9-].*'
+          AND NOT c.name =~ '(?i).*-dc[0-9].*'
+          AND NOT c.name =~ '(?i).*dc[0-9]+\\..*'
+          AND NOT EXISTS {
+            MATCH (c)-[:DCFor]->(:Domain)
+          }
         RETURN c.name AS name
         LIMIT $max_paths
         """,
@@ -277,7 +291,8 @@ def main():
     with driver.session() as session:
         for query_name, cypher in QUERIES:
             try:
-                results = session.run(cypher, max_paths=MAX_PATHS)
+                cypher_final = cypher.replace("$max_hops", str(MAX_HOPS))
+                results = session.run(cypher_final, max_paths=MAX_PATHS)
                 records = list(results)
 
                 if not records:
@@ -319,6 +334,20 @@ def main():
     driver.close()
 
     # ── Summary Table ─────────────────────────────────────────────────────────
+    # Deduplicate by (severity, category, source) — keep shortest hop count.
+    # Full path detail is preserved in the output above.
+    seen = {}
+    for severity, category, src, hops in summary:
+        key = (severity, category, src)
+        if key not in seen:
+            seen[key] = hops
+        else:
+            # Keep shortest hop count — "-" for non-path entries
+            if hops != "-" and seen[key] != "-":
+                seen[key] = min(seen[key], hops)
+
+    deduped = [(sev, cat, src, hops) for (sev, cat, src), hops in seen.items()]
+
     console.print("[bold white]─── FINDINGS SUMMARY ───[/bold white]")
     table = Table(show_header=True, header_style="bold white", border_style="dim")
     table.add_column("Severity", width=10)
@@ -327,9 +356,9 @@ def main():
     table.add_column("Hops",     width=6, justify="center")
 
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
-    summary.sort(key=lambda x: order.get(x[0], 99))
+    deduped.sort(key=lambda x: (order.get(x[0], 99), x[1], x[2]))
 
-    for severity, category, src, hops in summary:
+    for severity, category, src, hops in deduped:
         color = SEVERITY_COLOR.get(severity, "white")
         table.add_row(
             f"[{color}]{severity}[/{color}]",
@@ -341,9 +370,9 @@ def main():
     console.print(table)
     console.print()
 
-    crits = sum(1 for s in summary if s[0] == "CRITICAL")
-    highs = sum(1 for s in summary if s[0] == "HIGH")
-    meds  = sum(1 for s in summary if s[0] == "MEDIUM")
+    crits = sum(1 for s in deduped if s[0] == "CRITICAL")
+    highs = sum(1 for s in deduped if s[0] == "HIGH")
+    meds  = sum(1 for s in deduped if s[0] == "MEDIUM")
     console.print(
         f"  [bold red]{crits} CRITICAL[/bold red]  "
         f"[bold yellow]{highs} HIGH[/bold yellow]  "
