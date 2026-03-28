@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bh_paths.py - BloodHound CE Attack Path Narrator
+snoopy.py - BloodHound CE Attack Path Narrator
 Queries Neo4j directly and outputs human-readable attack paths.
 """
 
@@ -18,7 +18,7 @@ NEO4J_PASSWORD = "bloodhoundcommunityedition"  # change if you set a custom pass
 # ── Limits ────────────────────────────────────────────────────────────────────
 # Increase for large domains to avoid missing findings.
 # Decrease for faster runs on small datasets.
-MAX_PATHS = 25
+MAX_PATHS = 500
 
 # ── Edge Narratives ───────────────────────────────────────────────────────────
 EDGE_NARRATIVES = {
@@ -260,7 +260,7 @@ def inline_path(path):
 def main():
     console = Console()
     console.print(Panel.fit(
-        "[bold red]BloodHound CE - Attack Path Narrator[/bold red]\n"
+        "[bold red]Snoopy — BloodHound CE Attack Path Narrator[/bold red]\n"
         "[dim]Querying Neo4j at localhost:7687[/dim]"
     ))
 
