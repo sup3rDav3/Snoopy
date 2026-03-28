@@ -57,7 +57,15 @@ EDGE_NARRATIVES = {
     "HasSIDHistory":         "has SID history linking to",
     "TrustedBy":             "is trusted by",
     "CrossForestTrust":      "has a cross-forest trust to",
-    "ADCSESC3":              "can abuse ADCS ESC3 against",
+    "ADCSESC1":              "ESC1 — Enrollable template with SAN specification",
+    "ADCSESC3":              "ESC3 — Enrollment agent abuse",
+    "ADCSESC4":              "ESC4 — Vulnerable certificate template ACL",
+    "ADCSESC6a":             "ESC6 — CA flag EDITF_ATTRIBUTESUBJECTALTNAME2 (domain auth)",
+    "ADCSESC6b":             "ESC6 — CA flag EDITF_ATTRIBUTESUBJECTALTNAME2 (any auth)",
+    "ADCSESC9a":             "ESC9 — Certificate mapping abuse (domain auth)",
+    "ADCSESC9b":             "ESC9 — Certificate mapping abuse (any auth)",
+    "ADCSESC10a":            "ESC10 — Weak certificate mapping (domain auth)",
+    "ADCSESC10b":            "ESC10 — Weak certificate mapping (any auth)",
 }
 
 # ── Severity Rules ────────────────────────────────────────────────────────────
@@ -120,6 +128,18 @@ SEVERITY_RULES = [
         any(r in DIRECT_ABUSE_EDGES for r in rels)
     ), "HIGH"),
 
+    # ── CRITICAL: ADCS direct domain compromise ──────────────────────────────
+    (lambda rels, dst, src: (
+        any(r in ["ADCSESC1", "ADCSESC3", "ADCSESC4", "ADCSESC6a", "ADCSESC6b"]
+            for r in rels)
+    ), "CRITICAL"),
+
+    # ── HIGH: ADCS certificate mapping abuse ─────────────────────────────────
+    (lambda rels, dst, src: (
+        any(r in ["ADCSESC9a", "ADCSESC9b", "ADCSESC10a", "ADCSESC10b"]
+            for r in rels)
+    ), "HIGH"),
+
     # ── MEDIUM: everything else ───────────────────────────────────────────────
     (lambda rels, dst, src: True, "MEDIUM"),
 ]
@@ -139,10 +159,7 @@ QUERIES = [
             (u:User {enabled:true})-[*1..$max_hops]->(g:Group)
         )
         WHERE g.name =~ '(?i)domain admins@.*'
-          AND NOT EXISTS {
-            MATCH (u)-[:MemberOf*1..]->(dg:Group)
-            WHERE dg.name =~ '(?i)domain admins@.*'
-          }
+          AND NOT (u)-[:MemberOf*1..]->(g)
         RETURN p
         LIMIT $max_paths
         """,
@@ -204,6 +221,25 @@ QUERIES = [
             WHERE dg.name =~ '(?i)domain admins@.*'
           }
         RETURN p
+        LIMIT $max_paths
+        """,
+    ),
+    (
+        "ADCS — ESC Findings",
+        """
+        MATCH (n)-[r]->(d:Domain)
+        WHERE type(r) STARTS WITH 'ADCS'
+          AND NOT 'Tag_Tier_Zero' IN labels(n)
+          AND NOT (n.name =~ '(?i)administrators@.*'
+               OR n.name =~ '(?i)domain controllers@.*'
+               OR n.name =~ '(?i)enterprise admins@.*'
+               OR n.name =~ '(?i)domain admins@.*')
+        RETURN
+          labels(n) AS src_labels,
+          n.name    AS src_name,
+          type(r)   AS rel_type,
+          d.name    AS domain
+        ORDER BY type(r), n.name
         LIMIT $max_paths
         """,
     ),
@@ -300,6 +336,47 @@ def main():
 
                 first_keys = list(records[0].keys())
 
+                # ADCS queries return flat rows, not paths — check BEFORE non-path handler
+                if "rel_type" in first_keys and "src_labels" in first_keys:
+                    findings = []
+                    for record in records:
+                        src_labels  = list(record["src_labels"])
+                        src_name    = record["src_name"] or "Unknown"
+                        rel_type    = record["rel_type"]
+                        domain      = record["domain"] or "Unknown"
+
+                        # Build display name from labels and name
+                        short = src_name.split("@")[0] if "@" in src_name else src_name
+                        if "User" in src_labels:
+                            src_display = f"User({short})"
+                        elif "Group" in src_labels:
+                            src_display = f"Group({short})"
+                        elif "Computer" in src_labels:
+                            src_display = f"Computer({short})"
+                        else:
+                            #src_display = f"Object({short})"
+                            continue
+
+                        # Get description from EDGE_NARRATIVES
+                        esc_num = rel_type.replace("ADCSESC", "ESC")
+                        description = EDGE_NARRATIVES.get(rel_type, f"{esc_num} — ADCS escalation path")
+                        line = f"{src_display} →[{description}]→ Domain({domain})  (1 hop)"
+
+                        # Severity based on ESC type
+                        severity = get_severity([rel_type], f"domain({domain})", src_display)
+                        findings.append((line, severity, src_display, 1))
+
+                    if not findings:
+                        continue
+
+                    console.print(f"[bold yellow]{query_name}[/bold yellow]")
+                    for line, severity, src_display, hops in findings:
+                        color = SEVERITY_COLOR.get(severity, "white")
+                        console.print(f"  [{color}][{severity}][/{color}]  {line}")
+                        summary.append((severity, query_name, src_display, hops))
+                    console.print()
+                    continue
+
                 # Non-path queries (e.g. unconstrained delegation)
                 if "p" not in first_keys:
                     console.print(f"[bold yellow]{query_name}[/bold yellow]")
@@ -352,7 +429,7 @@ def main():
     table = Table(show_header=True, header_style="bold white", border_style="dim")
     table.add_column("Severity", width=10)
     table.add_column("Category", width=45)
-    table.add_column("Source",   width=28)
+    table.add_column("Source",   width=35)
     table.add_column("Hops",     width=6, justify="center")
 
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
